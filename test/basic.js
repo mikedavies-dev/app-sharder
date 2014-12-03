@@ -358,3 +358,11 @@ describe("Send a message to a single node", function() {
         master.stop();
     });
 });
+
+describe("Test the NodeSelector class", function() {
+    it("Create a node selector", function () {
+
+
+
+    });
+});

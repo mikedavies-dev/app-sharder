@@ -115,7 +115,7 @@ var NodeMaster = function (options, next) {
             if (_.size(sockets) == 0)
                 throw "There are no nodes currently connected.";
 
-
+            // do we need to choose a particular client to send this to?
 
         };
 
@@ -136,6 +136,14 @@ var NodeMaster = function (options, next) {
     };
 }
 
+////////////////////////////////////////////////////////////////////////////
+// NodeSelector
+
+var NodeSelector = function () {
+    return {
+
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////
 // MessageTokenizer
@@ -213,6 +221,10 @@ module.exports = (function(){
 
             messageParser: function() {
                 return new MessageParser();
+            },
+
+            nodeSelector: function() {
+                return new NodeSelector();
             }
         }
     }
