@@ -234,8 +234,26 @@ describe("Message Tokenizer", function() {
             .to.have.property('name')
             .and.equal("do-some-searching");
     });
-});
 
+    it("Serialize / parse a date", function () {
+
+        var tokenizer = AppSharder.messageTokenizer(),
+            parser = AppSharder.messageParser(),
+            dateVal = new Date();
+
+        var msg = tokenizer.serialize({
+            sent: dateVal
+        });
+
+        parser.addData(msg);
+
+        expect(parser.hasMessage()).to.equal(true);
+
+        var msg2 = parser.nextMessage();
+
+        expect(msg2.sent.getTime()).to.equal(dateVal.getTime());
+    });
+});
 
 describe("Send a message to a single node", function() {
 
@@ -339,7 +357,7 @@ describe("Send a message to a single node", function() {
         connectNodes(master, 3, [
             {
                 message: "test-message",
-                callback: function () {
+                callback: function (msg) {
                     gotMessage = true;
                 }
             }
@@ -353,16 +371,142 @@ describe("Send a message to a single node", function() {
 
         delayWait(1000, function () {
             return gotMessage;
-        })
+        });
+
+        master.stop();
+    });
+
+    it("Send a message to all nodes", function () {
+
+        var master = startMaster(),
+            messageCount = 0,
+            nodeCount = 3;
+
+        // connect the nodes
+        connectNodes(master, nodeCount, [
+            {
+                message: "test-message",
+                callback: function (msg) {
+                    messageCount++;
+                }
+            }
+        ]);
+
+        master.send(
+            null,
+            "test-message",
+            "some content"
+        );
+
+        delayWait(1000, function () {
+            return messageCount == nodeCount;
+        });
+
+        master.stop();
+    });
+
+    it("Request data from a single node", function () {
+
+        var master = startMaster(),
+            nodeCount = 25,
+            nodeReply = "";
+
+        // connect the nodes
+        connectNodes(master, nodeCount, [
+            {
+                message: "test-message",
+                callback: function (msg) {
+                    msg.reply({
+                        sent: new Date(),
+                        num: 1234
+                    });
+                }
+            }
+        ]);
+
+        master.request(
+            null,
+            "test-message",
+            "some content",
+            function (err, reply) {
+                nodeReply = reply;
+
+                console.log(reply.responseTime);
+            }
+        );
+
+        delayWait(1000, function () {
+            return nodeReply == "Some Data";
+        });
 
         master.stop();
     });
 });
 
 describe("Test the NodeSelector class", function() {
-    it("Create a node selector", function () {
 
+    it("Do we have this node?", function () {
 
+        var selector = AppSharder.nodeSelector();
 
+        selector.addNode("Server1Key", "Server1Value");
+
+        expect(selector.hasNode("Server1Key")).to.equal(true);
+    });
+
+    it("Create a node selector and get a single node", function () {
+
+        var selector = AppSharder.nodeSelector();
+
+        selector.addNode("Server1Key", "Server1Value");
+        selector.addNode("Server2", "Server2");
+        selector.addNode("Server3", "Server3");
+        selector.addNode("Server4", "Server4");
+
+        var node = selector.getNode("Server1Key");
+
+        expect(node).to.equal("Server1Value");
+    });
+
+    it("Select multiple nodes based on the id (null == all)", function () {
+
+        var selector = AppSharder.nodeSelector();
+
+        selector.addNode("Server1", "Server1");
+        selector.addNode("Server2", "Server2");
+        selector.addNode("Server3", "Server3");
+        selector.addNode("Server4", "Server4");
+
+        var nodes1 = selector.getKeyNodes("bacd");
+        expect(nodes1.length).to.equal(1);
+
+        var nodes2 = selector.getKeyNodes();
+        expect(nodes2.length).to.equal(4);
+    });
+
+    it("Remove a node", function () {
+
+        var selector = AppSharder.nodeSelector();
+
+        selector.addNode("Server1", "Server1");
+        selector.addNode("Server2", "Server2");
+        selector.addNode("Server3", "Server3");
+        selector.addNode("Server4", "Server4");
+
+        var nodes1 = selector.getKeyNodes();
+        expect(nodes1.length).to.equal(4);
+
+        selector.removeNode("Server1");
+        selector.removeNode("Server2");
+        selector.removeNode("Server3");
+
+        // we only have Server4 left so we should only ever get that one
+        expect(selector.getKeyNodes("1")[0]).to.equal("Server4");
+        expect(selector.getKeyNodes("2")[0]).to.equal("Server4");
+        expect(selector.getKeyNodes("3")[0]).to.equal("Server4");
+        expect(selector.getKeyNodes("4")[0]).to.equal("Server4");
+
+        var nodes2 = selector.getKeyNodes();
+        expect(nodes2.length).to.equal(1);
     });
 });
