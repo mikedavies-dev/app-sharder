@@ -3,13 +3,20 @@ var expect = require("chai").expect,
     deasync = require('deasync'),
     _ = require("lodash");
 
-describe("Test framework setup", function() {
-    it("Make sure tests work", function(){
-        expect(null).to.be.null();
-    });
-});
+var AppSharder = require("../"),
 
-var AppSharder = require("../");
+    delayWait = function (timeout, callback) {
+
+        var start = new Date();
+
+        while (!callback()) {
+
+            if ((new Date()) - start > timeout)
+                throw "Timeout expired";
+
+            require('deasync').sleep(10);
+        }
+    }
 
 describe("Basic Tests", function() {
     it("Create a basic object", function(){
@@ -21,19 +28,21 @@ describe("Basic Tests", function() {
 
         // this should fail because we are not starting the master server
 
-        var done = false;
-        var startError = null;
+        var done = false,
+            startError = null;
+            node = AppSharder.node({
+                host: "127.0.0.1",
+                port: 1233
+            });
 
-        AppSharder.node({
-            host: "127.0.0.1",
-            port: 1233
-        }, function (err) {
+        node.connect(function (err) {
             startError= err;
             done= true;
         });
 
-        while (!done)
-            require('deasync').sleep(10);
+        delayWait(2000, function () {
+            return done;
+        });
 
         expect(startError).not.to.be.null();
     });
@@ -48,28 +57,34 @@ describe("Basic Tests", function() {
 
         var master = AppSharder.master({
             port: 1234
-        }, function (err) {
+        });
+
+        master.start(function (err) {
             masterError= err;
             done= true;
         });
 
-        while (!done)
-            require('deasync').sleep(10);
+        delayWait(1000, function () {
+            return done;
+        });
 
         done = false;
 
         var node = AppSharder.node({
             port: 1234,
             host: "127.0.0.1"
-        }, function (err) {
+        });
+
+        node.connect(function (err) {
             nodeError= err;
             done= true;
         });
 
-        while (!done)
-            require('deasync').sleep(10);
+        delayWait(1000, function () {
+            return done;
+        });
 
-        // we shoud have connected OK
+        // we should have connected OK
         expect(masterError).to.be.null();
         expect(nodeError).to.be.null();
 
@@ -87,7 +102,9 @@ describe("Basic Tests", function() {
 
         var master = AppSharder.master({
             port: 1234
-        }, function (err) {
+        });
+
+        master.start(function (err) {
             masterError= err;
             done= true;
         });
@@ -99,14 +116,18 @@ describe("Basic Tests", function() {
 
         var node = AppSharder.node({
             port: 1234,
-            host: "127.0.0.1"
-        }, function (err) {
+            host: "127.0.0.1",
+            name: "FirstNode"
+        });
+
+        node.connect(function (err) {
             nodeError= err;
             done= true;
         });
 
-        while (!done)
-            require('deasync').sleep(10);
+        delayWait(1000, function () {
+            return done;
+        });
 
         // we shoud have connected OK
         expect(masterError).to.be.null();
@@ -114,7 +135,8 @@ describe("Basic Tests", function() {
 
         var status = master.status();
 
-        expect(status.nodeCount).to.equal(1);
+        expect(status.nodes.length).to.equal(1);
+        expect(status.nodes[0].name).to.equal("FirstNode");
 
         // disconnect the client
         node.disconnect();
@@ -124,9 +146,230 @@ describe("Basic Tests", function() {
 
         // get the status again
         var status = master.status();
-        expect(status.nodeCount).to.equal(0);
+        expect(status.nodes.length).to.equal(0);
+
+        // check up time
+        expect(status.upTime).to.be.greaterThan(100);
 
         master.stop();
+    });
+});
+
+describe("Handle node authentication", function () {
+    it("Send auth data to the server, pass", function(){
+
+        // this should fail because we are not starting the master server
+
+        var done = false,
+            masterError = null,
+            nodeError = null
+
+        var master = AppSharder.master({
+            port: 1234
+        });
+
+        master.start(function (err) {
+                masterError= err;
+                done= true;
+            })
+
+            .on("authenticate", function (auth) {
+
+                if (auth.data.key == "some-auth-data")
+                    auth.accept();
+                else
+                    auth.reject();
+            });
+
+        while (!done)
+            require('deasync').sleep(10);
+
+        done = false;
+
+        var node = AppSharder.node({
+            port: 1234,
+            host: "127.0.0.1",
+            name: "FirstNode",
+            auth: {
+                key: "some-auth-data",
+                extra: "we can anything in the auth object"
+            }
+        });
+
+        node.connect(function (err) {
+            nodeError= err;
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        // we shoud have connected OK
+        expect(masterError).to.be.null();
+        expect(nodeError).to.be.null();
+
+        var status = master.status();
+
+        expect(status.nodes.length).to.equal(1);
+        expect(status.nodes[0].name).to.equal("FirstNode");
+
+        // disconnect the client
+        node.disconnect();
+
+        master.stop();
+    });
+
+    it("Send auth data to the server, fail", function(){
+
+        // this should fail because we are not starting the master server
+
+        var done = false,
+            masterError = null,
+            nodeError = null
+
+        var master = AppSharder.master({
+            port: 1234
+        });
+
+        master.start(function (err) {
+                masterError= err;
+                done= true;
+            })
+
+            .on("authenticate", function (auth) {
+
+                if (auth.data.key == "some-auth-data")
+                    auth.accept();
+                else
+                    auth.reject();
+            });
+
+        while (!done)
+            require('deasync').sleep(10);
+
+        done = false;
+
+        var node = AppSharder.node({
+            port: 1234,
+            host: "127.0.0.1",
+            name: "FirstNode",
+            auth: {
+                key: "we-dont-know-the-key",
+                extra: "we can anything in the auth object"
+            }
+        });
+
+        node.connect(function (err) {
+            nodeError= err;
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        // we shoud have connected OK
+        expect(masterError).to.be.null();
+        expect(nodeError).to.be.null();
+
+        var status = master.status();
+
+        expect(status.nodes.length).to.equal(0);
+
+        // disconnect the client
+        node.disconnect();
+
+        master.stop();
+    });
+})
+
+describe("Node and Master options", function() {
+
+    it("Make sure passing null into options still creates null options", function () {
+
+        var
+            master = AppSharder.master(),
+            options = master.options();
+
+        expect(options).not.to.be.undefined();
+        expect(options).not.to.be.null();
+        expect(options.host).to.equal("0.0.0.0");
+    });
+
+    it("Default request timeout", function () {
+
+        var
+            master = AppSharder.master({
+                port: 1234
+            });
+
+        var options = master.options();
+
+        expect(options.port).to.equal(1234);
+        expect(options.requestTimeout).to.equal(5000);
+    });
+
+    it("Default master port", function () {
+
+        var master = AppSharder.master({});
+
+        var options = master.options();
+
+        expect(options.port).to.equal(5134);
+    });
+
+    it("Add two messages handlers via the node options", function () {
+
+        var
+            done = false,
+            master = AppSharder.master();
+
+        master.start(function (err) {
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        // now create the node
+        done= false;
+
+        var gotMessage1 = false,
+            gotMessage2 = false,
+            node = AppSharder.node({
+                messages: [
+                    {
+                        name: "test-message1",
+                        handler: function (msg) {
+                            gotMessage1 = true;
+                        }
+                    },
+                    {
+                        name: "test-message2",
+                        handler: function (msg) {
+                            gotMessage2 = true;
+                        }
+                    }
+                ]
+            });
+
+        node.connect(function (err) {
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        // send the messages
+        master.send(null, "test-message1", "some message");
+        master.send(null, "test-message2", "some message");
+
+        delayWait(1000, function () {
+            return gotMessage1 && gotMessage2;
+        });
     });
 });
 
@@ -259,14 +502,22 @@ describe("Send a message to a single node", function() {
 
     var
 
-        startMaster = function () {
+        startMaster = function (options) {
 
             var done = false,
-                error = null;
+                error = null,
+                defaultOptions = {
+                    port: 1234
+                };
 
-            var master = AppSharder.master({
-                port: 1234
-            }, function (err) {
+            if (!options)
+                options = {};
+
+            options = _.defaults(options, defaultOptions);
+
+            var master = AppSharder.master(options);
+
+            master.start(function (err) {
                 error= err;
                 done= true;
             });
@@ -292,7 +543,9 @@ describe("Send a message to a single node", function() {
                 var node = AppSharder.node({
                     port: 1234,
                     host: "127.0.0.1"
-                }, function (err) {
+                });
+
+                node.connect(function (err) {
                     error= err;
                     done= true;
                 });
@@ -314,20 +567,7 @@ describe("Send a message to a single node", function() {
 
             var status = master.status();
 
-            expect(status.nodeCount).to.equal(nodeCount);
-        },
-
-        delayWait = function (timeout, callback) {
-
-            var start = new Date();
-
-            while (!callback()) {
-
-                if ((new Date()) - start > timeout)
-                    throw "Timeout expired";
-
-                require('deasync').sleep(10);
-            }
+            expect(status.nodes.length).to.equal(nodeCount);
         }
 
     it("Send a message to a master that does not have nodes", function () {
@@ -345,7 +585,6 @@ describe("Send a message to a single node", function() {
         expect(sendMessage).to.throw("There are no nodes currently connected.");
 
         master.stop();
-
     });
 
     it("Send a message to a node", function () {
@@ -405,11 +644,11 @@ describe("Send a message to a single node", function() {
         master.stop();
     });
 
-    it("Request data from a single node", function () {
+    it("Request data from a all nodes", function () {
 
         var master = startMaster(),
             nodeCount = 25,
-            nodeReply = "";
+            nodeReply = null;
 
         // connect the nodes
         connectNodes(master, nodeCount, [
@@ -430,14 +669,66 @@ describe("Send a message to a single node", function() {
             "some content",
             function (err, reply) {
                 nodeReply = reply;
-
-                console.log(reply.responseTime);
             }
         );
 
         delayWait(1000, function () {
-            return nodeReply == "Some Data";
+
+            if (nodeReply == null)
+                return false;
+
+            return nodeReply.replies.length == nodeCount;
         });
+
+        master.stop();
+    });
+
+    it("Request and cause a timeout", function () {
+
+        var master = startMaster({
+                requestTimeout: 100
+            }),
+            nodeCount = 1,
+            nodeReply = null,
+            nodeError = null;
+
+        // connect the nodes
+        connectNodes(master, nodeCount, [
+            {
+                message: "test-message",
+                callback: function (msg) {
+
+                    // sleep for 1 second
+                    require('deasync').sleep(500);
+
+                    msg.reply({
+                        sent: new Date(),
+                        num: 1234
+                    });
+                }
+            }
+        ]);
+
+        master.request(
+            null,
+            "test-message",
+            "some content",
+            function (err, reply) {
+                nodeReply = reply;
+                nodeError = err;
+            }
+        );
+
+        delayWait(1000, function () {
+
+            if (nodeReply == null)
+                return false;
+
+            return nodeReply.replies != null;
+        });
+
+        expect(nodeReply.replies.length).to.equal(0);
+        expect(nodeError).to.equal("Timeout Expired");
 
         master.stop();
     });

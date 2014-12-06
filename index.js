@@ -10,19 +10,75 @@ var HashRing = require("./HashRing"),
     _ = require("lodash"),
     events = require('events');
 
+// constants
+var DEFAULT_PORT = 5134,
+    DEFAULT_MASTER_HOST = "0.0.0.0",
+    DEFAULT_NODE_HOST = "127.0.0.1",
+    DEFAULT_REQUEST_TIMEOUT = 5000;
+
 ////////////////////////////////////////////////////////////////////////////
 // NodeClient
 
-var NodeClient = function (options, next) {
+var NodeClient = function (options) {
 
     // attempt to connect to the main server to register ourselves
     var client = new net.Socket(),
         eventsEmitter = new events.EventEmitter(),
         messageParser = new MessageParser(),
-        messageTokenizer = new MessageTokenizer();
+        messageTokenizer = new MessageTokenizer(),
+        defaultOptions = {
+            port: DEFAULT_PORT,
+            host: DEFAULT_NODE_HOST,
+            name: "",
+            auth: {}
+        };
+
+    if (!options)
+        options= {};
+
+    // merge the options
+    options = _.defaults(
+        options,
+        defaultOptions
+    );
 
     var disconnect = function () {
             client.end();
+        },
+
+        connect = function (next) {
+            client
+                .connect(options.port, options.host, function() {
+
+                    // send the welcome message
+                    var payload = messageTokenizer.serialize({
+                        isWelcome: true,
+                        name: options.name,
+                        auth: options.auth
+                    });
+
+                    client.write(payload);
+
+                    next(null);
+                })
+
+                .on('data', function(data) {
+
+                    // add the data to our buffer
+                    messageParser.addData(data);
+
+                    // process any complete messages
+                    processMessages();
+                })
+
+                .on('close', function() {
+                })
+
+                .on('error', function(err) {
+                    next(err);
+                });
+
+            return this;
         },
 
         on = function (event, callback) {
@@ -53,31 +109,21 @@ var NodeClient = function (options, next) {
                 // tell the world
                 eventsEmitter.emit(msg.name, msg);
             }
-        }
+        };
 
-    client
-        .connect(options.port, options.host, function() {
-            next(null);
+    // add any events passed in the options
+    if (options.messages) {
+        _.forEach(options.messages, function (eventInfo) {
+            eventsEmitter.on(
+                eventInfo.name,
+                eventInfo.handler
+            );
         })
-
-        .on('data', function(data) {
-
-            // add the data to our buffer
-            messageParser.addData(data);
-
-            // process any complete messages
-            processMessages();
-        })
-
-        .on('close', function() {
-        })
-
-        .on('error', function(err) {
-            next(err);
-        });
+    }
 
     return {
         disconnect: disconnect,
+        connect: connect,
         on: on
     }
 }
@@ -85,13 +131,28 @@ var NodeClient = function (options, next) {
 ////////////////////////////////////////////////////////////////////////////
 // NodeMaster
 
-var NodeMaster = function (options, next) {
+var NodeMaster = function (options) {
 
     var eventsEmitter = new events.EventEmitter(),
         nodeSelector = new NodeSelector(),
         tokenizer = new MessageTokenizer(),
         sockets = {},
-        pendingRequests = {};
+        upSince = null,
+        pendingRequests = {},
+        defaultOptions = {
+            requestTimeout: DEFAULT_REQUEST_TIMEOUT,
+            port: DEFAULT_PORT,
+            host: DEFAULT_MASTER_HOST
+        };
+
+    if (!options)
+        options= {};
+
+    // merge the options
+    options = _.defaults(
+        options,
+        defaultOptions
+    );
 
     var
 
@@ -129,8 +190,11 @@ var NodeMaster = function (options, next) {
             var socketInfo = {
                 socket: socket,
                 parser: new MessageParser(),
-                connected: new Date(),
-                uuid: socket.uuid
+                upSince: new Date(),
+                uuid: socket.uuid,
+                remoteAddress: socket.remoteAddress,
+                name: "",
+                authenticated: false
             };
 
             sockets[socket.uuid] = socketInfo;
@@ -140,13 +204,48 @@ var NodeMaster = function (options, next) {
 
             // tell the world
             eventsEmitter.emit('connect', socketInfo);
+        },
 
+        getOptions = function () {
+            return options;
         },
 
         status = function () {
+
+            var upTime = upSince != null ? new Date() - upSince : null,
+                nodes = [];
+
+            _.forEach(sockets, function (socket) {
+                nodes.push(getNodeInfo(socket.uuid));
+            })
+
             return {
-                nodeCount: _.size(sockets)
+                upTime: upTime,
+                nodes: nodes
             }
+        },
+
+        start = function (next) {
+
+            server
+                .on('error', function (e) {
+                    if (next)
+                        next(e);
+                })
+
+                .listen(
+                    options.port,
+                    options.host,
+                    function () {
+
+                        // when were we started?
+                        upSince = new Date();
+
+                        if (next)
+                            next(null);
+                });
+
+            return this;
         },
 
         stop= function() {
@@ -156,7 +255,11 @@ var NodeMaster = function (options, next) {
                 socket.socket.end();
             })
 
+            upSince = null;
+
             server.close();
+
+            return this;
         },
 
         on = function (event, callback) {
@@ -185,34 +288,130 @@ var NodeMaster = function (options, next) {
 
             // send the data to each node
             _.forEach(toSendNodes, function (node) {
-                node.socket.write(payload);
+                if (node.authenticated)
+                    node.socket.write(payload);
             })
 
             // return the message ID
             return messageId;
         },
 
-        request = function (shardId, message, content, callback) {
+        requestTimeoutExpired = function (pendingRequest) {
+
+            delete pendingRequests[pendingRequest.messageId];
+
+            // make sure we have a callback
+            if (!pendingRequest.callback)
+                return;
+
+            // send what we have so far
+            pendingRequest.callback("Timeout Expired", getRequestResponse(pendingRequest));
+        },
+
+        request = function (
+            shardId,
+            message,
+            content,
+            callback
+        ) {
 
             // send the message
-            var messageId = send(shardId, message, content);
-
-            // do we need to choose a particular client to send this to?
-            var toSendNodes = nodeSelector.getKeyNodes(shardId);
+            var messageId = send(shardId, message, content),
+                toSendNodes = nodeSelector.getKeyNodes(shardId),
+                timeout = options.requestTimeout,
+                timeoutObj = null;
 
             var pendingRequest = {
                 sent: new Date(),
                 replies: {},
-                callback: callback
+                callback: callback,
+                timeout: null,
+                messageId: messageId
             };
 
+            // do we have a timeout?
+            if (timeout != -1) {
+                pendingRequest.timeout = setTimeout(requestTimeoutExpired, timeout, pendingRequest);
+            }
+
             _.forEach(toSendNodes, function (node) {
+
+                if (!node.authenticated)
+                    return;
+
                 pendingRequest.replies[node.uuid] = {
                     received: null // not yet received
                 };
             });
 
             pendingRequests[messageId] = pendingRequest;
+        },
+
+        getNodeInfo = function (nodeId) {
+
+            if (!_.has(sockets, nodeId))
+                return null;
+
+            var socket = sockets[nodeId];
+
+            return {
+                name: socket.name,
+                upTime: new Date() - socket.upSince,
+                upSince: socket.upSince,
+                remoteAddress: socket.remoteAddress,
+                id: socket.uuid
+            }
+        },
+
+        getRequestResponse = function (pendingRequest) {
+
+            var response = {
+                responseTime: new Date() - pendingRequest.sent,
+                replies: []
+            };
+
+            _.forEach(pendingRequest.replies, function (val, key) {
+
+                if (!val.received)
+                    return;
+
+                var nodeResponse = {
+                    node: getNodeInfo(key),
+                    reply: val.reply,
+                    responseTime: new Date() - val.received
+                }
+
+                response.replies.push(nodeResponse);
+            });
+
+            return response;
+        },
+
+        processWelcomeMessage= function (socketInfo, msg) {
+
+            if (msg.name)
+                socketInfo.name = msg.name;
+
+            var authInfo = {
+                data: msg.auth,
+                node: getNodeInfo(socketInfo.uuid),
+
+                accept: function () {
+                    // allow inbound and outbound messages
+                    socketInfo.authenticated = true;
+                },
+                reject: function () {
+                    socketInfo.socket.end();
+                }
+            }
+
+            // tell the world
+            var listeners = eventsEmitter.listeners("authenticate");
+
+            if (listeners.length != 0)
+                eventsEmitter.emit("authenticate", authInfo);
+            else
+                socketInfo.authenticated= true;
         },
 
         processMessages = function () {
@@ -223,6 +422,18 @@ var NodeMaster = function (options, next) {
                 while (socketInfo.parser.hasMessage()) {
 
                     var msg = socketInfo.parser.nextMessage();
+
+                    // is this a welcome/auth message?
+                    if (msg.isWelcome) {
+                        processWelcomeMessage(socketInfo, msg);
+                        return;
+                    }
+
+                    // only process if this client is authenticated
+                    if (socketInfo.authenticated != true) {
+                        socketInfo.socket.end();
+                        continue;
+                    }
 
                     // make sure the response has a valid request.. otherwise ignore it
                     if (!_.has(pendingRequests, msg.id))
@@ -247,12 +458,18 @@ var NodeMaster = function (options, next) {
                     });
 
                     if (gotAllReplies) {
+
+                        // clear the timeout
+                        if (pendingRequest.timeout)
+                            clearInterval(pendingRequest.timeout);
+
                         delete pendingRequests[msg.id];
 
-                        pendingRequest.callback(null, {
-                            responseTime: new Date() - pendingRequest.sent,
-                            replies: pendingRequest.replies
-                        });
+                        // make sure we have a callback
+                        if (!pendingRequest.callback)
+                            continue;
+
+                        pendingRequest.callback(null, getRequestResponse(pendingRequest));
                     }
                 }
             })
@@ -261,21 +478,14 @@ var NodeMaster = function (options, next) {
     // create the server
     var server = net.createServer(socketConnected);
 
-    server
-        .on('error', function (e) {
-            next(e);
-        })
-
-        server.listen(options.port, function () {
-            next(null);
-        });
-
     return {
         status: status,
+        start: start,
         stop: stop,
         on: on,
         send: send,
-        request: request
+        request: request,
+        options: getOptions
     };
 }
 

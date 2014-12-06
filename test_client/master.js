@@ -5,16 +5,6 @@ var AppSharder = require("../"),
 var master = AppSharder.master(
     {
         port: 1234
-    },
-
-    function (err) {
-
-        if (err){
-            logEventMessage("Error starting server : " + err);
-            return;
-        }
-
-        logEventMessage("Server started");
     })
 
     .on("connect", function (client) {
@@ -24,6 +14,16 @@ var master = AppSharder.master(
     .on("disconnect", function (client) {
         logEventMessage("Client disconnected");
     });
+
+master.start(function (err) {
+
+    if (err){
+        logEventMessage("Error starting server : " + err);
+        return;
+    }
+
+    logEventMessage("Server started");
+});
 
 var
     startCommandPrompt = function () {
