@@ -19,6 +19,7 @@ var AppSharder = require("../"),
     }
 
 describe("Basic Tests", function() {
+
     it("Create a basic object", function(){
 
         expect(AppSharder).not.to.be.null();
@@ -155,34 +156,30 @@ describe("Basic Tests", function() {
     });
 });
 
+
+
 describe("Handle node authentication", function () {
     it("Send auth data to the server, pass", function(){
-
-        // this should fail because we are not starting the master server
 
         var done = false,
             masterError = null,
             nodeError = null
 
         var master = AppSharder.master({
-            port: 1234
+            port: 1234,
+            onAuthenticate: function (auth) {
+                return auth.data.key == "some-auth-data";
+            }
         });
 
         master.start(function (err) {
                 masterError= err;
                 done= true;
-            })
-
-            .on("authenticate", function (auth) {
-
-                if (auth.data.key == "some-auth-data")
-                    auth.accept();
-                else
-                    auth.reject();
             });
 
-        while (!done)
-            require('deasync').sleep(10);
+        delayWait(1000, function () {
+            return done;
+        });
 
         done = false;
 
@@ -205,7 +202,7 @@ describe("Handle node authentication", function () {
             return done;
         });
 
-        // we shoud have connected OK
+        // we should have connected OK
         expect(masterError).to.be.null();
         expect(nodeError).to.be.null();
 
@@ -222,31 +219,25 @@ describe("Handle node authentication", function () {
 
     it("Send auth data to the server, fail", function(){
 
-        // this should fail because we are not starting the master server
-
         var done = false,
             masterError = null,
             nodeError = null
 
         var master = AppSharder.master({
-            port: 1234
+            port: 1234,
+            onAuthenticate: function (auth) {
+                return auth.data.key == "some-auth-data";
+            }
         });
 
         master.start(function (err) {
-                masterError= err;
-                done= true;
-            })
+            masterError= err;
+            done= true;
+        });
 
-            .on("authenticate", function (auth) {
-
-                if (auth.data.key == "some-auth-data")
-                    auth.accept();
-                else
-                    auth.reject();
-            });
-
-        while (!done)
-            require('deasync').sleep(10);
+        delayWait(1000, function () {
+            return done;
+        });
 
         done = false;
 
@@ -269,12 +260,123 @@ describe("Handle node authentication", function () {
             return done;
         });
 
-        // we shoud have connected OK
+        // we should have connected OK
+        expect(masterError).to.be.null();
+        expect(nodeError).to.equal("Remote authentication failed");
+
+        var status = master.status();
+
+        expect(status.nodes.length).to.equal(0);
+
+        // disconnect the client
+        node.disconnect();
+
+        master.stop();
+    });
+
+    it("Send auth data to the client, pass", function(){
+
+        var done = false,
+            masterError = null,
+            nodeError = null
+
+        var master = AppSharder.master({
+            port: 1234,
+            auth: {
+                key: "some-auth-data",
+                extra: "we can anything in the auth object"
+            }
+        });
+
+        master.start(function (err) {
+            masterError= err;
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        done = false;
+
+        var node = AppSharder.node({
+            port: 1234,
+            host: "127.0.0.1",
+            name: "FirstNode",
+            onAuthenticate: function (auth) {
+                return auth.data.key == "some-auth-data";
+            }
+        });
+
+        node.connect(function (err) {
+            nodeError= err;
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        // we should have connected OK
         expect(masterError).to.be.null();
         expect(nodeError).to.be.null();
 
         var status = master.status();
 
+        expect(status.nodes.length).to.equal(1);
+        expect(status.nodes[0].name).to.equal("FirstNode");
+
+        // disconnect the client
+        node.disconnect();
+
+        master.stop();
+    });
+
+    it("Send auth data to the client, fail", function(){
+
+        var done = false,
+            masterError = null,
+            nodeError = null
+
+        var master = AppSharder.master({
+            port: 1234,
+            auth: {
+                key: "this-will-fail",
+                extra: "we can anything in the auth object"
+            }
+        });
+
+        master.start(function (err) {
+            masterError= err;
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        done = false;
+
+        var node = AppSharder.node({
+            port: 1234,
+            host: "127.0.0.1",
+            name: "FirstNode",
+            onAuthenticate: function (auth) {
+                return auth.data.key == "some-auth-data";
+            }
+        });
+
+        node.connect(function (err) {
+            nodeError= err;
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        // we shouldn't have anything connected
+        var status = master.status();
         expect(status.nodes.length).to.equal(0);
 
         // disconnect the client
@@ -801,3 +903,80 @@ describe("Test the NodeSelector class", function() {
         expect(nodes2.length).to.equal(1);
     });
 });
+
+/*
+
+This does not appear to work for some reason.. connecting via TLS in the same thread/process
+Does not connect..?
+
+describe("Server TLS", function () {
+
+    it ("Start a server using TLS", function () {
+
+        var done = false,
+            masterError = null,
+            nodeError = null;
+
+        var master = AppSharder.master({
+            port: 1234,
+            tls: {
+                enabled: true,
+                key: "./test/certs/master/private-key.pem",
+                cert: "./test/certs/master/public-cert.pem"
+            }
+        });
+
+        master.start(function (err) {
+            masterError= err;
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        expect(masterError).to.be.null();
+
+        var node = AppSharder.node({
+            port: 1234,
+            host: "127.0.0.1",
+            name: "FirstNode",
+            tls: {
+                enabled: true
+            }
+        });
+
+        node.connect(function (err) {
+            nodeError= err;
+            done= true;
+        });
+
+        delayWait(1000, function () {
+            return done;
+        });
+
+        // we should have connected OK
+        expect(masterError).to.be.null();
+        expect(nodeError).to.be.null();
+
+        var status = master.status();
+
+        expect(status.nodes.length).to.equal(1);
+        expect(status.nodes[0].name).to.equal("FirstNode");
+
+        // disconnect the client
+        node.disconnect();
+
+        // wait for the disconnect event to happen
+        require('deasync').sleep(100);
+
+        // get the status again
+        var status = master.status();
+        expect(status.nodes.length).to.equal(0);
+
+        // check up time
+        expect(status.upTime).to.be.greaterThan(100);
+
+        master.stop();
+    });
+});*/

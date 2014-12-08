@@ -6,6 +6,8 @@
 
 var HashRing = require("./HashRing"),
     net = require('net'),
+    tls = require('tls'),
+    fs = require('fs'),
     uuid = require('node-uuid'),
     _ = require("lodash"),
     events = require('events');
@@ -22,10 +24,13 @@ var DEFAULT_PORT = 5134,
 var NodeClient = function (options) {
 
     // attempt to connect to the main server to register ourselves
-    var client = new net.Socket(),
+    var client = null,
         eventsEmitter = new events.EventEmitter(),
         messageParser = new MessageParser(),
         messageTokenizer = new MessageTokenizer(),
+        onConnected = null,
+        onConnectCalled = false,
+        authenticator = new Authenticator(),
         defaultOptions = {
             port: DEFAULT_PORT,
             host: DEFAULT_NODE_HOST,
@@ -43,24 +48,31 @@ var NodeClient = function (options) {
     );
 
     var disconnect = function () {
-            client.end();
+            if (client)
+                client.end();
         },
 
         connect = function (next) {
+
+            onConnected= next;
+
+            // create the server
+            if (options.tls && options.tls.enabled){
+                client = tls.connect(
+                    options.port,
+                    options.host,
+                    {
+                        rejectUnauthorized: false
+                    },
+                    function () { });
+            }
+            else {
+                client = new net.Socket();
+
+                client.connect(options.port, options.host, function () { });
+            }
+
             client
-                .connect(options.port, options.host, function() {
-
-                    // send the welcome message
-                    var payload = messageTokenizer.serialize({
-                        isWelcome: true,
-                        name: options.name,
-                        auth: options.auth
-                    });
-
-                    client.write(payload);
-
-                    next(null);
-                })
 
                 .on('data', function(data) {
 
@@ -72,13 +84,39 @@ var NodeClient = function (options) {
                 })
 
                 .on('close', function() {
+                    runOnConnect("Connection closed by remote server");
                 })
 
                 .on('error', function(err) {
-                    next(err);
+                    runOnConnect(err);
                 });
 
+            authenticator.startAuthentication({
+                socket: client,
+                auth: options.auth,
+                name: options.name,
+                onAuthenticate: options.onAuthenticate,
+                onSuccess: function () {
+                    runOnConnect(null);
+                },
+                onFail: function (err) {
+                    runOnConnect(err);
+
+                }
+            });
+
             return this;
+        },
+
+        runOnConnect = function (err) {
+
+            if (onConnectCalled)
+                return;
+
+            if (onConnected)
+                onConnected(err);
+
+            onConnectCalled= true;
         },
 
         on = function (event, callback) {
@@ -94,6 +132,17 @@ var NodeClient = function (options) {
             while (messageParser.hasMessage()) {
 
                 var msg = messageParser.nextMessage();
+
+                if (msg == null) {
+                    // kill the connection?
+                    client.end();
+                    continue;
+                }
+
+                if (!authenticator.isAuthenticated()) {
+                    authenticator.processMessage(msg);
+                    continue;
+                }
 
                 msg.reply = function (reply) {
 
@@ -173,17 +222,11 @@ var NodeMaster = function (options) {
                 })
 
                 .on('close', function() {
-
-                    // tell the world
-                    eventsEmitter.emit('disconnect', sockets[socket.uuid]);
-
-                    // add the node to our node selector
-                    nodeSelector.removeNode(socket.uuid);
-
-                    delete sockets[socket.uuid];
+                    reportDisconnect(socketInfo, null);
                 })
 
                 .on('error', function(err) {
+                    reportDisconnect(socketInfo, err);
                 });
 
             // store the socket
@@ -194,7 +237,7 @@ var NodeMaster = function (options) {
                 uuid: socket.uuid,
                 remoteAddress: socket.remoteAddress,
                 name: "",
-                authenticated: false
+                authenticator: new Authenticator()
             };
 
             sockets[socket.uuid] = socketInfo;
@@ -204,6 +247,44 @@ var NodeMaster = function (options) {
 
             // tell the world
             eventsEmitter.emit('connect', socketInfo);
+
+            // start the authentication process
+            socketInfo.authenticator.startAuthentication({
+                socket: socket,
+                auth: options.auth,
+                name: options.name,
+                //onAuthenticate: options.onAuthenticate,
+
+                onAuthenticate: function (authInfo) {
+
+                    socketInfo.name = authInfo.name;
+
+                    if (_.isFunction(options.onAuthenticate))
+                        return options.onAuthenticate(authInfo);
+
+                    return true;
+                },
+                onSuccess: function () {
+                    eventsEmitter.emit('authenticated', socketInfo);
+                },
+                onFail: function () {
+                    // do something else?!
+                }
+            });
+        },
+
+        reportDisconnect = function (socketInfo, err) {
+
+            if (!_.has(sockets, socketInfo.uuid))
+                return;
+
+            // tell the world
+            eventsEmitter.emit('disconnect', socketInfo);
+
+            // add the node to our node selector
+            nodeSelector.removeNode(socketInfo.uuid);
+
+            delete sockets[socketInfo.uuid];
         },
 
         getOptions = function () {
@@ -288,7 +369,7 @@ var NodeMaster = function (options) {
 
             // send the data to each node
             _.forEach(toSendNodes, function (node) {
-                if (node.authenticated)
+                if (node.authenticator.isAuthenticated())
                     node.socket.write(payload);
             })
 
@@ -318,8 +399,7 @@ var NodeMaster = function (options) {
             // send the message
             var messageId = send(shardId, message, content),
                 toSendNodes = nodeSelector.getKeyNodes(shardId),
-                timeout = options.requestTimeout,
-                timeoutObj = null;
+                timeout = options.requestTimeout;
 
             var pendingRequest = {
                 sent: new Date(),
@@ -336,7 +416,7 @@ var NodeMaster = function (options) {
 
             _.forEach(toSendNodes, function (node) {
 
-                if (!node.authenticated)
+                if (!node.authenticator.isAuthenticated())
                     return;
 
                 pendingRequest.replies[node.uuid] = {
@@ -387,33 +467,6 @@ var NodeMaster = function (options) {
             return response;
         },
 
-        processWelcomeMessage= function (socketInfo, msg) {
-
-            if (msg.name)
-                socketInfo.name = msg.name;
-
-            var authInfo = {
-                data: msg.auth,
-                node: getNodeInfo(socketInfo.uuid),
-
-                accept: function () {
-                    // allow inbound and outbound messages
-                    socketInfo.authenticated = true;
-                },
-                reject: function () {
-                    socketInfo.socket.end();
-                }
-            }
-
-            // tell the world
-            var listeners = eventsEmitter.listeners("authenticate");
-
-            if (listeners.length != 0)
-                eventsEmitter.emit("authenticate", authInfo);
-            else
-                socketInfo.authenticated= true;
-        },
-
         processMessages = function () {
 
             // process the message(s)
@@ -423,15 +476,13 @@ var NodeMaster = function (options) {
 
                     var msg = socketInfo.parser.nextMessage();
 
-                    // is this a welcome/auth message?
-                    if (msg.isWelcome) {
-                        processWelcomeMessage(socketInfo, msg);
+                    if (msg == null) {
+                        socketInfo.socket.end();
                         return;
                     }
 
-                    // only process if this client is authenticated
-                    if (socketInfo.authenticated != true) {
-                        socketInfo.socket.end();
+                    if (!socketInfo.authenticator.isAuthenticated()) {
+                        socketInfo.authenticator.processMessage(msg);
                         continue;
                     }
 
@@ -475,8 +526,20 @@ var NodeMaster = function (options) {
             })
         };
 
+    var server= null;
+
     // create the server
-    var server = net.createServer(socketConnected);
+    if (options.tls && options.tls.enabled){
+
+        var tlsOptions = {
+            key: fs.readFileSync(options.tls.key),
+            cert: fs.readFileSync(options.tls.cert)
+        };
+
+        server = tls.createServer(tlsOptions, socketConnected);
+    }
+    else
+        server = net.createServer(socketConnected);
 
     return {
         status: status,
@@ -487,6 +550,112 @@ var NodeMaster = function (options) {
         request: request,
         options: getOptions
     };
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Authenticator
+
+var Authenticator = function () {
+
+    var
+        tokenizer = new MessageTokenizer(),
+        localAuthenticated = null,
+        remoteAuthenticated = null,
+        authOptions = {}
+
+    var
+        startAuthentication = function (options) {
+
+            authOptions = options;
+
+            // send the welcome message with auth info
+            var payload = tokenizer.serialize({
+                isWelcome: true,
+                name: authOptions.name,
+                auth: authOptions.auth
+            });
+
+            authOptions.socket.write(payload);
+        },
+
+        checkResult = function () {
+
+            // make sure we have some results
+            if (localAuthenticated == null ||
+                remoteAuthenticated == null)
+                return;
+
+            if (isAuthenticated()) {
+                if (authOptions.onSuccess)
+                    authOptions.onSuccess();
+            }
+            else {
+
+                var msg = "";
+
+                if (!localAuthenticated && remoteAuthenticated)
+                    msg = "Local authentication failed";
+
+                else if (localAuthenticated && !remoteAuthenticated)
+                    msg = "Remote authentication failed";
+
+                else
+                    msg = "Local & remote authentication failed";
+
+                if (authOptions.onFail)
+                    authOptions.onFail(msg);
+
+                // disconnect them
+                authOptions.socket.end();
+            }
+        },
+
+        processMessage = function (msg) {
+
+            if (_.has(msg, "authenticated")) {
+                remoteAuthenticated= msg.authenticated;
+                checkResult();
+                return;
+            }
+
+            var peerCert = null;
+
+            if (_.isFunction(authOptions.socket.getPeerCertificate))
+                peerCert = authOptions.socket.getPeerCertificate();
+
+            var authInfo = {
+                data: msg.auth,
+                host: authOptions.socket.remoteAddress,
+                name: msg.name,
+                cert: peerCert
+            }
+
+            // Attempt to authenticate the node
+            if (authOptions.onAuthenticate && _.isFunction(authOptions.onAuthenticate))
+                localAuthenticated = authOptions.onAuthenticate(authInfo);
+            else
+                localAuthenticated= true;
+
+            // tell the client we have or have not authenticated them
+            var payload = tokenizer.serialize({
+                isWelcome: true,
+                authenticated: localAuthenticated
+            });
+
+            authOptions.socket.write(payload);
+
+            checkResult();
+        },
+
+        isAuthenticated = function () {
+            return localAuthenticated && remoteAuthenticated;
+        }
+
+    return {
+        startAuthentication: startAuthentication,
+        isAuthenticated: isAuthenticated,
+        processMessage: processMessage
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -609,7 +778,13 @@ var MessageParser = function () {
             buffer = buffer.substring(endIndex+1);
 
             // parse the josn
-            return JSON.parse(msg, jsonDeserializeHelper);
+            try {
+                return JSON.parse(msg, jsonDeserializeHelper);
+            }
+            catch (ex) {
+                // ignore it.. or maybe dump the connection?
+                return null;
+            }
         }
 
     return {
