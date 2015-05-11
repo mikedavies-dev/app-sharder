@@ -297,7 +297,9 @@ var NodeMaster = function (options) {
                 nodes = [];
 
             _.forEach(sockets, function (socket) {
-                nodes.push(getNodeInfo(socket.uuid));
+                // make sure the socket is authenticated
+                if (socket.authenticator.isAuthenticated())
+                    nodes.push(getNodeInfo(socket.uuid));
             })
 
             return {
